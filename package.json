@@ -1,0 +1,24 @@
+{
+  "name": "market-sentinel-ar",
+  "version": "3.12.4",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "20.x"
+  },
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node server/index.js",
+    "seed": "node server/seed.js",
+    "build": "npm ci",
+    "render-build": "npm ci"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.4.0",
+    "express-session": "^1.17.3",
+    "pg": "^8.12.0"
+  }
+}

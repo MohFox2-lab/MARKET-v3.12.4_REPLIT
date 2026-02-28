@@ -1,0 +1,206 @@
+
+/* =========================================================
+   MARKET SENTINEL AR — Light Minimal Theme (UI Only)
+   Scope: Visual overrides only. No logic/backend changes.
+   ========================================================= */
+
+:root {
+  --ms-bg: #f4f6f9;
+  --ms-surface: #ffffff;
+  --ms-surface-2: #f8fafc;
+  --ms-border: rgba(17, 24, 39, 0.10);
+  --ms-text: #111827;
+  --ms-muted: #6b7280;
+
+  --ms-blue: #2563eb;
+  --ms-blue-2: #3b82f6;
+
+  --ms-green: #22c55e;
+  --ms-green-2: #16a34a;
+
+  --ms-red: #ef4444;
+  --ms-red-2: #dc2626;
+
+  --ms-purple: #8b5cf6;
+}
+
+html, body {
+  background: var(--ms-bg) !important;
+  color: var(--ms-text) !important;
+  font-family: 'Tajawal', system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif !important;
+}
+
+a { color: var(--ms-blue) !important; }
+a:hover { opacity: 0.9; }
+
+/* Generic containers often used in dark themes */
+.theme-light .bg-black,
+.theme-light .bg-gray-900,
+.theme-light .bg-slate-900,
+.theme-light .bg-slate-950,
+.theme-light .bg-zinc-900,
+.theme-light .bg-neutral-900,
+.theme-light .bg-[#0b1220],
+.theme-light .bg-[#0b1220] * {
+  background-color: transparent !important;
+}
+
+/* Surfaces / cards */
+.theme-light .card,
+.theme-light .panel,
+.theme-light .box,
+.theme-light .glass,
+.theme-light .section,
+.theme-light .container-card,
+.theme-light .dashboard-card,
+.theme-light .shadow-card,
+.theme-light [class*="card"],
+.theme-light [class*="panel"] {
+  background: var(--ms-surface) !important;
+  border: 1px solid var(--ms-border) !important;
+  border-radius: 16px !important;
+  box-shadow: 0 10px 28px rgba(0,0,0,0.06) !important;
+}
+
+/* Headers / chips */
+.theme-light .chip,
+.theme-light .badge,
+.theme-light [class*="badge"],
+.theme-light [class*="chip"] {
+  border-radius: 999px !important;
+  border: 1px solid var(--ms-border) !important;
+  background: var(--ms-surface-2) !important;
+  color: var(--ms-text) !important;
+}
+
+/* Inputs */
+.theme-light input,
+.theme-light select,
+.theme-light textarea {
+  background: var(--ms-surface) !important;
+  border: 1px solid var(--ms-border) !important;
+  color: var(--ms-text) !important;
+  border-radius: 12px !important;
+  box-shadow: none !important;
+}
+.theme-light input::placeholder,
+.theme-light textarea::placeholder {
+  color: rgba(107,114,128,0.9) !important;
+}
+
+/* Buttons */
+.theme-light button,
+.theme-light .btn,
+.theme-light [class*="btn"] {
+  border-radius: 12px !important;
+  font-weight: 600 !important;
+  transition: transform .12s ease, box-shadow .12s ease, opacity .12s ease !important;
+}
+
+.theme-light .btn-primary,
+.theme-light button.primary,
+.theme-light button[data-variant="primary"] {
+  background: var(--ms-blue) !important;
+  color: #fff !important;
+  border: 1px solid rgba(37,99,235,0.35) !important;
+}
+
+.theme-light button:hover,
+.theme-light .btn:hover {
+  transform: translateY(-1px) !important;
+  box-shadow: 0 10px 24px rgba(0,0,0,0.08) !important;
+}
+
+/* Text */
+.theme-light h1, .theme-light h2, .theme-light h3, .theme-light h4 {
+  color: var(--ms-text) !important;
+}
+.theme-light p, .theme-light span, .theme-light div {
+  color: inherit;
+}
+.theme-light .muted,
+.theme-light [class*="muted"],
+.theme-light .text-muted,
+.theme-light .text-gray-400,
+.theme-light .text-gray-300,
+.theme-light .text-slate-300,
+.theme-light .text-slate-400 {
+  color: var(--ms-muted) !important;
+}
+
+/* Status colors */
+.theme-light .text-green-400,
+.theme-light .text-green-500,
+.theme-light .success {
+  color: var(--ms-green-2) !important;
+}
+.theme-light .text-red-400,
+.theme-light .text-red-500,
+.theme-light .danger {
+  color: var(--ms-red-2) !important;
+}
+.theme-light .text-blue-400,
+.theme-light .text-blue-500 {
+  color: var(--ms-blue) !important;
+}
+.theme-light .text-purple-400,
+.theme-light .text-purple-500 {
+  color: var(--ms-purple) !important;
+}
+
+/* Pills / traffic light */
+.theme-light .pill-green,
+.theme-light .status-green,
+.theme-light [data-status="green"] {
+  background: rgba(34,197,94,0.12) !important;
+  color: var(--ms-green-2) !important;
+  border: 1px solid rgba(34,197,94,0.22) !important;
+}
+.theme-light .pill-red,
+.theme-light .status-red,
+.theme-light [data-status="red"] {
+  background: rgba(239,68,68,0.12) !important;
+  color: var(--ms-red-2) !important;
+  border: 1px solid rgba(239,68,68,0.22) !important;
+}
+.theme-light .pill-yellow,
+.theme-light .status-yellow,
+.theme-light [data-status="yellow"] {
+  background: rgba(234,179,8,0.12) !important;
+  color: #b45309 !important;
+  border: 1px solid rgba(234,179,8,0.22) !important;
+}
+
+/* Charts container */
+.theme-light canvas {
+  filter: none !important;
+}
+.theme-light .chart,
+.theme-light .chart-wrap,
+.theme-light [class*="chart"] {
+  background: var(--ms-surface) !important;
+  border: 1px solid var(--ms-border) !important;
+  border-radius: 16px !important;
+}
+
+/* Remove neon/glow from dark theme if present */
+.theme-light .glow,
+.theme-light [class*="glow"],
+.theme-light .shadow-green,
+.theme-light .shadow-red {
+  box-shadow: none !important;
+}
+
+/* Layout background sections */
+.theme-light header,
+.theme-light nav,
+.theme-light main,
+.theme-light footer,
+.theme-light section {
+  background: transparent !important;
+}
+
+/* Subtle separators */
+.theme-light hr {
+  border-color: rgba(17,24,39,0.10) !important;
+}

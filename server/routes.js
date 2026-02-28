@@ -1,0 +1,1462 @@
+import express from 'express';
+import rateLimit from 'express-rate-limit';
+import { analyzeSymbol } from './analyze.js';
+import { getSentiment, setManualSentiment } from './sentimentProviders.js';
+import { computeSectorHeatmap } from './sectorHeatmap.js';
+import { getSectorDefs } from './sectorConfig.js';
+// v1.6: snapshots history + score breakdown + SMF/protection filters
+
+export function makeApiRouter(pool) {
+  const r = express.Router();
+
+  // Mutex to prevent cross-request interference when temporarily setting process.env.STOCK_PROVIDER
+  // (keeps /api/analyze output identical while ensuring multi-user isolation)
+  let providerEnvMutex = Promise.resolve();
+  function withProviderEnvLock(fn) {
+    const run = providerEnvMutex.then(fn, fn);
+    providerEnvMutex = run.catch(() => undefined);
+    return run;
+  }
+
+
+  // Rate limiting (public hardening)
+  const analyzeLimiter = rateLimit({
+    windowMs: 10 * 60 * 1000,
+    max: 120,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { ok: false, error: 'RATE_LIMIT', message_ar: 'تم تجاوز حد الطلبات. حاول لاحقاً.' }
+  });
+
+  const demoSeedLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 20,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { ok: false, error: 'RATE_LIMIT', message_ar: 'تم تجاوز حد الطلبات. حاول لاحقاً.' }
+  });
+
+
+  // Health
+  r.get('/health', async (_req, res) => {
+    res.json({ ok: true, name: 'MARKET_SENTINEL_AR', version: '3.12.4' });
+  });
+
+  // -------- Settings & Providers (v1.3) --------
+  async function getSetting(key, fallback = null) {
+    // v1.4: support both app_settings (preferred) and legacy settings
+    try {
+      const r0 = await pool.query('SELECT value FROM app_settings WHERE key = $1', [key]);
+      if (r0.rows?.length) return r0.rows[0].value;
+    } catch (_) {}
+    try {
+      const r1 = await pool.query('SELECT value FROM settings WHERE key = $1', [key]);
+      if (r1.rows?.length) return r1.rows[0].value;
+    } catch (_) {}
+    return fallback;
+  }
+
+  async function setSetting(key, value) {
+    // v1.4: write to app_settings, also keep legacy settings in sync if exists
+    await pool.query(
+      'INSERT INTO app_settings(key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value',
+      [key, value]
+    );
+    try {
+      await pool.query(
+        'INSERT INTO settings(key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value',
+        [key, value]
+      );
+    } catch (_) {}
+  }
+
+
+  // --- Decision Support (v1.9) ---
+  function decisionLiteFromSnapshot(row, riskProfile = 'balanced') {
+    const score = Number(row?.trustScore);
+    const traffic = String(row?.traffic || '');
+    const smfSig = String(row?.smfSignal || '').toUpperCase();
+    const instSig = String(row?.instSignal || '').toUpperCase();
+
+    const rules = {
+      conservative: { consider: 85, watch: 70 },
+      balanced: { consider: 80, watch: 60 },
+      aggressive: { consider: 75, watch: 55 },
+    }[riskProfile] || { consider: 80, watch: 60 };
+
+    // Basic decision tags:
+    // AVOID: RED or very low score
+    if (traffic === 'RED' || (Number.isFinite(score) && score < 45)) {
+      return { tag: 'AVOID', confidence: 'HIGH', why: ['مخاطر مرتفعة حسب درجة الثقة/الحالة.'] };
+    }
+
+    // REDUCE_RISK: YELLOW with distribution signals
+    if (traffic === 'YELLOW' && (smfSig === 'DISTRIBUTION' || instSig === 'DISTRIBUTION')) {
+      return { tag: 'REDUCE_RISK', confidence: 'MED', why: ['إشارات تصريف (SMF/مؤسسي) مع حالة بحذر.'] };
+    }
+
+    // CONSIDER: GREEN and at least one accumulation signal and score threshold
+    if (traffic === 'GREEN' && Number.isFinite(score) && score >= rules.consider && (smfSig === 'ACCUMULATION' || instSig === 'ACCUMULATION')) {
+      return { tag: 'CONSIDER', confidence: 'MED', why: ['مخاطر منخفضة نسبيًا مع إشارات تجميع.'] };
+    }
+
+    // WATCH: default for non-red
+    if (Number.isFinite(score) && score >= rules.watch) {
+      return { tag: 'WATCH', confidence: 'LOW', why: ['متابعة حتى تتضح إشارة أقوى.'] };
+    }
+
+    return { tag: 'WATCH', confidence: 'LOW', why: ['متابعة بحذر.'] };
+  }
+  
+  function radarLiteFromSnapshot(row) {
+    const traffic = String(row?.traffic || '');
+    const score = Number(row?.trustScore);
+    const smfSig = String(row?.smfSignal || '').toUpperCase();
+    const instSig = String(row?.instSignal || '').toUpperCase();
+
+    let opp = Number.isFinite(score) ? score : 50;
+    if (traffic === 'GREEN') opp += 5;
+    if (traffic === 'RED') opp -= 15;
+    if (smfSig === 'ACCUMULATION') opp += 8;
+    if (instSig === 'ACCUMULATION') opp += 6;
+    if (smfSig === 'DISTRIBUTION') opp -= 12;
+    if (instSig === 'DISTRIBUTION') opp -= 10;
+    opp = Math.max(0, Math.min(100, Math.round(opp)));
+    let opportunityTag = 'MID_OPPORTUNITY';
+    if (opp >= 80 && traffic !== 'RED') opportunityTag = 'HIGH_OPPORTUNITY';
+    else if (opp < 50) opportunityTag = 'LOW_OPPORTUNITY';
+
+    let ex = 30;
+    if (traffic === 'RED') ex += 25;
+    if (smfSig === 'DISTRIBUTION') ex += 18;
+    if (instSig === 'DISTRIBUTION') ex += 14;
+    if (smfSig === 'ACCUMULATION') ex -= 6;
+    if (instSig === 'ACCUMULATION') ex -= 5;
+    if (Number.isFinite(score) && score < 50) ex += 10;
+    ex = Math.max(0, Math.min(100, Math.round(ex)));
+    let exitTag = 'MID_EXIT_RISK';
+    if (ex >= 70) exitTag = 'HIGH_EXIT_RISK';
+    else if (ex <= 35) exitTag = 'LOW_EXIT_RISK';
+
+    return { opportunityScore: opp, opportunityTag, exitScore: ex, exitTag };
+  }
+
+
+  function finalDecisionFromDecision(decision, opportunity, exit, owned = false, exposure = 'MED', ctx = {}) {
+    const tag = String(decision?.tag || "").toUpperCase();
+    const confIn = String(decision?.confidence || "").toUpperCase() || "MED";
+    const baseWhy = Array.isArray(decision?.why) ? decision.why : [];
+
+    const opp = Number(opportunity?.score);
+    const ex = Number(exit?.score);
+
+    const indicators = ctx?.indicators || {};
+    const alerts = Array.isArray(ctx?.alerts) ? ctx.alerts : [];
+    const smfSig = String(ctx?.smf?.signal || "").toUpperCase();
+    const instDir = String(ctx?.institutionalFlow?.direction || ctx?.institutionalFlow?.signal || "").toUpperCase();
+    const earnSig = String(ctx?.earningsGrowth?.signal || "").toUpperCase();
+    const traffic = String(ctx?.traffic || "").toUpperCase();
+
+    const highAlerts = alerts.filter(a => String(a?.severity || a?.level || "").toUpperCase() === "HIGH");
+    const hasHigh = highAlerts.length > 0;
+
+    const to20 = Number(indicators?.price_to_sma20);
+    const to200 = Number(indicators?.price_to_sma200);
+    const overextended = Number.isFinite(to20) ? to20 > 1.15 : false;
+    const weakTrend = Number.isFinite(to200) ? to200 < 1 : false;
+
+    const hasAccum = (smfSig === "ACCUMULATION") || (instDir === "ACCUMULATION");
+    const hasDist = (smfSig === "DISTRIBUTION") || (instDir === "DISTRIBUTION");
+    const strongDist = (smfSig === "DISTRIBUTION" && instDir === "DISTRIBUTION");
+
+    // ---------------------------------------------
+    // NOT OWNED (Entry Decision Support) — keep v2.1.2 behavior
+    // ---------------------------------------------
+    if (!owned) {
+      const labelMap = {
+        CONSIDER: { label: "دخول أفضل", code: "ENTER" },
+        WATCH: { label: "متابعة", code: "WATCH" },
+        REDUCE_RISK: { label: "تجنّب الدخول", code: "AVOID_ENTRY" },
+        AVOID: { label: "تجنّب", code: "AVOID" },
+      };
+      const base = labelMap[tag] || { label: "متابعة", code: "WATCH" };
+
+      let label = base.label;
+      let code = base.code;
+      let confidence = confIn || "MED";
+
+      if (tag === "CONSIDER" && Number.isFinite(opp) && opp >= 85 && Number.isFinite(ex) && ex <= 30 && !overextended && !hasHigh) {
+        label = "دخول قوي";
+        code = "ENTER_STRONG";
+        confidence = "HIGH";
+      } else if (tag === "CONSIDER" && overextended) {
+        label = "دخول بحذر";
+        code = "ENTER_CAUTION";
+      }
+
+      if ((tag === "REDUCE_RISK" || tag === "AVOID") && Number.isFinite(ex) && ex >= 75) {
+        label = "تجنّب قوي";
+        code = "AVOID_STRONG";
+        confidence = "HIGH";
+      }
+
+      return {
+        label,
+        code,
+        confidence,
+        why: baseWhy.slice(0, 6),
+        positionMode: "NOT_OWNED"
+      };
+    }
+
+    // ---------------------------------------------
+    // OWNED (Position Management) — v2.1.2
+    // Decisions: ADD / HOLD_STRONG / HOLD_CAUTION / TRIM / EXIT
+    // ---------------------------------------------
+    const exp = String(exposure || 'MED').toUpperCase(); // LOW | MED | HIGH
+    const blockers = [];
+    const riskControls = [];
+
+    // Blockers that prevent ADD even if the stock is strong
+    if (overextended) blockers.push("متمدّد فوق SMA20 (Overextended) — التعزيز الآن مخاطرة.");
+    if (!hasAccum) blockers.push("لا توجد إشارة تجميع قوية (SMF/مؤسسي) حتى الآن.");
+    if (hasHigh) blockers.push("يوجد تنبيه/تنبيهات عالية (HIGH).");
+    if (weakTrend) blockers.push("السهم تحت SMA200 — الاتجاه الطويل غير داعم للتعزيز.");
+    if (earnSig === "DECLINE") blockers.push("اتجاه نمو الأرباح يتدهور — التعزيز غير مفضل.");
+
+    // Risk control tips
+    if (overextended) riskControls.push("تجنّب التعزيز أثناء التمدد؛ انتظر تهدئة/تصحيح أو تأكيد سيولة.");
+    if (weakTrend) riskControls.push("راقب SMA200 كخط دفاع؛ الكسر تحته يزيد خطر التخفيف.");
+    if (hasHigh) riskControls.push("إذا ظهرت تنبيهات HIGH متعددة، افحص سببها قبل زيادة التعرض.");
+    if (hasDist) riskControls.push("وجود تصريف (SMF/مؤسسي) يعني أن التخفيف قد يكون أنسب من التعزيز.");
+
+    // Owner decision rules
+    let action = "HOLD_CAUTION";
+    let label = "احتفاظ مع حذر";
+    let code = "HOLD_CAUTION";
+    let confidence = confIn || "MED";
+
+    // Exposure-aware thresholds (more strict when exposure is HIGH)
+    const thr = {
+      LOW: { exitHigh: 75, exitVeryHigh: 90, exitStrong: 82 },
+      MED: { exitHigh: 70, exitVeryHigh: 85, exitStrong: 78 },
+      HIGH:{ exitHigh: 60, exitVeryHigh: 78, exitStrong: 72 },
+    }[exp] || { exitHigh: 70, exitVeryHigh: 85, exitStrong: 78 };
+
+    const exitVeryHigh = Number.isFinite(ex) ? ex >= thr.exitVeryHigh : (traffic === "RED" && strongDist);
+    const exitHigh = Number.isFinite(ex) ? ex >= thr.exitHigh : (traffic === "RED" || strongDist);
+
+    if (exitVeryHigh || (highAlerts.length >= 2 && (strongDist || exp === 'HIGH'))) {
+      action = "EXIT";
+      label = "خروج/إغلاق مركز";
+      code = "EXIT";
+      confidence = "HIGH";
+    } else if (exitHigh || (strongDist && (overextended || weakTrend || earnSig === "DECLINE" || hasHigh))) {
+      // Prefer TRIM unless it is extremely bad
+      if (Number.isFinite(ex) && ex >= thr.exitStrong) {
+        action = "EXIT";
+        label = "خروج أقوى";
+        code = "EXIT_STRONG";
+        confidence = "HIGH";
+      } else {
+        action = "TRIM";
+        label = "تخفيف/جني جزء";
+        code = "TRIM";
+        confidence = hasHigh ? "HIGH" : "MED";
+      }
+    } else {
+      // Not in exit zone
+      const canAdd = (Number.isFinite(opp) ? opp >= 85 : tag === "CONSIDER") && (Number.isFinite(ex) ? ex <= 25 : true) && !overextended && !hasHigh && hasAccum && !weakTrend && earnSig !== "DECLINE";
+      const strongHold = (Number.isFinite(opp) ? opp >= 75 : (tag === "CONSIDER" || tag === "WATCH")) && (Number.isFinite(ex) ? ex <= 35 : true) && !hasHigh && traffic !== "RED";
+
+      if (canAdd) {
+        action = "ADD";
+        label = (Number.isFinite(opp) && opp >= 90 && Number.isFinite(ex) && ex <= 20) ? "تعزيز قوي" : "تعزيز/زيادة مركز";
+        code = (label === "تعزيز قوي") ? "ADD_STRONG" : "ADD";
+        confidence = (label === "تعزيز قوي") ? "HIGH" : "MED";
+      } else if (strongHold) {
+        action = "HOLD_STRONG";
+        label = "احتفاظ قوي";
+        code = "HOLD_STRONG";
+        confidence = (traffic === "GREEN" && hasAccum) ? "HIGH" : "MED";
+
+        // If opp is high but we didnt add, expose blockers as a reason
+        if (Number.isFinite(opp) && opp >= 80) {
+          // Keep blockers as guidance
+        }
+      } else {
+        action = "HOLD_CAUTION";
+        label = "احتفاظ مع حذر";
+        code = "HOLD_CAUTION";
+        confidence = "LOW";
+      }
+
+      // If overextended but otherwise strong -> explicitly keep HOLD not ADD
+      if (action === "HOLD_STRONG" && overextended) {
+        action = "HOLD_STRONG";
+        label = "احتفاظ قوي (بدون تعزيز)";
+        code = "HOLD_STRONG_NO_ADD";
+      }
+    }
+
+    // Build why list: combine the most important reasons
+    const why = [];
+    // Prefer context from opportunity/exit for owners
+    if (Array.isArray(opportunity?.why)) why.push(...opportunity.why.slice(0, 3));
+    if (Array.isArray(exit?.why)) why.push(...exit.why.slice(0, 2));
+    // Include decision reasons (v1.9 tag)
+    why.push(...baseWhy.slice(0, 2));
+
+    // Add one blocker reason if not adding
+    if (action !== "ADD" && action !== "ADD_STRONG" && blockers.length) {
+      why.push("سبب منع التعزيز: " + blockers[0]);
+    }
+
+    return {
+      label,
+      code,
+      action,
+      confidence,
+      why: Array.from(new Set(why)).slice(0, 6),
+      blockers: blockers.slice(0, 4),
+      riskControls: riskControls.slice(0, 4),
+      positionMode: "OWNED",
+      exposure: exp
+    };
+  }
+
+
+
+r.get('/providers', async (_req, res) => {
+    res.json({
+      ok: true,
+      providers: [
+        { id: 'yahoo_free', label: 'Yahoo Finance (مجاني/متأخر)', markets: ['US', 'SA'], needsKey: false, tier: 'free' },
+        { id: 'alphavantage_free', label: 'AlphaVantage (مجاني محدود)', markets: ['US'], needsKey: true, tier: 'free' },
+        { id: 'finnhub_paid', label: 'Finnhub (مدفوع/أدق)', markets: ['US'], needsKey: true, tier: 'paid' },
+        { id: 'eodhd_paid', label: 'EODHD (مدفوع/أدق للسعودي)', markets: ['SA'], needsKey: true, tier: 'paid' },
+        { id: 'demo', label: 'Demo (تجريبي)', markets: ['US', 'SA'], needsKey: false, tier: 'demo' },
+      ],
+    });
+  });
+
+  r.get('/settings', async (_req, res) => {
+    const data_mode = await getSetting('data_mode', 'free');
+    const provider_us = await getSetting('provider_us', 'yahoo_free');
+    const provider_sa = await getSetting('provider_sa', 'yahoo_free');
+    const risk_profile = await getSetting('risk_profile', 'balanced'); // v1.9 Decision Support
+    const silent_mode = await getSetting('silent_mode', false);
+    const min_severity_to_show = await getSetting('min_severity_to_show', 'MED');
+    res.json({ ok: true, settings: { data_mode, provider_us, provider_sa, risk_profile, silent_mode, min_severity_to_show } });
+  });
+
+  r.put('/settings', async (req, res) => {
+    const { data_mode, provider_us, provider_sa, risk_profile, silent_mode, min_severity_to_show } = req.body || {};
+    if (typeof data_mode === 'string') await setSetting('data_mode', String(data_mode).toLowerCase() === 'pro' ? 'pro' : 'free');
+    if (typeof provider_us === 'string') await setSetting('provider_us', provider_us);
+    if (typeof provider_sa === 'string') await setSetting('provider_sa', provider_sa);
+    if (typeof risk_profile === 'string') await setSetting('risk_profile', risk_profile);
+
+    if (typeof silent_mode === 'boolean') await setSetting('silent_mode', !!silent_mode);
+    if (typeof min_severity_to_show === 'string') {
+      const v = String(min_severity_to_show || '').toUpperCase();
+      await setSetting('min_severity_to_show', (v === 'HIGH' || v === 'LOW' || v === 'MED') ? v : 'MED');
+    }
+
+    res.json({ ok: true });
+
+  // -------- Sector Rotation Heatmap (v3.9) --------
+  // GET /api/sector/heatmap?market=US&tf=D
+  r.get('/sector/heatmap', async (req, res) => {
+    const market = (req.query.market || '').toString().toUpperCase() || 'US';
+    const tf = (req.query.tf || 'D').toString().toUpperCase();
+    const data_mode = await getSetting('data_mode', 'free');
+    const provider_us = await getSetting('provider_us', 'yahoo_free');
+    const provider_sa = await getSetting('provider_sa', 'yahoo_free');
+    const provider = (market === 'SA') ? provider_sa : provider_us;
+
+    try {
+      const out = await computeSectorHeatmap({ market, tf, provider, mode: data_mode });
+      res.json(out);
+    } catch (e) {
+      res.status(500).json({ ok: false, error: 'SECTOR_HEATMAP_FAILED', message_ar: 'تعذر إنشاء خارطة القطاعات حالياً.' });
+    }
+  });
+
+  });
+
+  // Stocks catalog
+  r.get('/stocks', async (req, res) => {
+    const market = (req.query.market || '').toString().toUpperCase();
+    const search = (req.query.search || '').toString().trim();
+
+    const params = [];
+    const where = [];
+    if (market === 'US' || market === 'SA') {
+      params.push(market);
+      where.push(`market = $${params.length}`);
+    }
+    if (search) {
+      params.push(`%${search}%`);
+      where.push(`(symbol ILIKE $${params.length} OR name ILIKE $${params.length})`);
+    }
+
+    const sql = `SELECT id, symbol, market, name, currency, created_at
+                 FROM stocks
+                 ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+                 ORDER BY created_at DESC, symbol ASC
+                 LIMIT 200`;
+
+    const { rows } = await pool.query(sql, params);
+    res.json({ ok: true, data: rows });
+  });
+
+  r.get('/stocks/:id', async (req, res) => {
+    const id = Number(req.params.id);
+    const { rows } = await pool.query('SELECT id, symbol, market, name, currency, created_at FROM stocks WHERE id=$1', [id]);
+    if (!rows.length) return res.status(404).json({ ok: false, error: 'STOCK_NOT_FOUND' });
+    res.json({ ok: true, data: rows[0] });
+  });
+
+  // Watchlist
+  r.get('/watchlist', async (_req, res) => {
+    const { rows } = await pool.query(`
+      SELECT w.created_at as added_at, s.id, s.symbol, s.market, s.name, s.currency,
+             ss.price, ss.change_percent as "changePercent", ss.volume,
+             ss.trust_score as "trustScore", ss.traffic,
+             ss.smf_available as "smfAvailable", ss.smf_score as "smfScore", ss.smf_signal as "smfSignal",
+             ss.institutional_score as "instScore", ss.institutional_signal as "instSignal"
+      FROM watchlist w
+      JOIN stocks s ON s.id = w.stock_id
+      LEFT JOIN LATERAL (
+        SELECT * FROM stock_snapshots ss
+        WHERE ss.stock_id = s.id
+        ORDER BY ss.as_of DESC
+        LIMIT 1
+      ) ss ON true
+      ORDER BY w.created_at DESC
+    `);
+
+        const risk_profile = await getSetting('risk_profile', 'balanced');
+    const out = (rows || []).map(r0 => {
+      const d = decisionLiteFromSnapshot(r0, risk_profile);
+      return { ...r0, decisionTag: d.tag, decisionConfidence: d.confidence, decisionWhy: d.why };
+    });
+
+    res.json({ ok: true, data: out });
+
+  });
+
+  
+  // Portfolio Health (Psychological Guard) — executive risk warning
+  r.get('/portfolio/health', async (_req, res) => {
+    try {
+      const { rows: wl } = await pool.query(`
+        SELECT s.symbol, s.market
+        FROM watchlist w
+        JOIN stocks s ON s.id = w.stock_id
+        ORDER BY w.created_at DESC
+      `);
+
+      const sectorDefsUS = getSectorDefs('US') || [];
+      const sectorDefsSA = getSectorDefs('SA') || [];
+
+      const resolveSector = (market, symbol) => {
+        const m = String(market || '').toUpperCase();
+        const s = String(symbol || '').toUpperCase();
+        const defs = m === 'SA' ? sectorDefsSA : sectorDefsUS;
+        for (const d of defs) {
+          const list = (d?.symbols || []).map(x => String(x || '').toUpperCase());
+          if (list.includes(s)) return d.sector;
+        }
+        return 'UNKNOWN';
+      };
+
+      const items = [];
+      let redCount = 0;
+      let c01Count = 0;
+      let a09Count = 0;
+
+      const sectorRed = new Map();
+
+      for (const it of wl) {
+        const symbol = it.symbol;
+        const market = it.market;
+
+        const { rows: jr } = await pool.query(
+          `SELECT created_at, traffic, trust_score, confidence, alerts_json, clusters_json
+           FROM decision_journal
+           WHERE symbol=$1 AND market=$2
+           ORDER BY created_at DESC
+           LIMIT 1`,
+          [symbol, market]
+        );
+
+        const latest = jr[0] || null;
+        const traffic = latest?.traffic || null;
+
+        const sector = resolveSector(market, symbol);
+
+        const alerts = Array.isArray(latest?.alerts_json) ? latest.alerts_json : [];
+        const clusters = Array.isArray(latest?.clusters_json) ? latest.clusters_json : [];
+
+        const hasC01 = clusters.some(c => c?.code === 'C01');
+        const hasA09 = alerts.some(a => a?.code === 'A09');
+
+        if (traffic === 'RED') {
+          redCount++;
+          sectorRed.set(sector, (sectorRed.get(sector) || 0) + 1);
+        }
+        if (hasC01) c01Count++;
+        if (hasA09) a09Count++;
+
+        items.push({
+          symbol,
+          market,
+          sector,
+          traffic,
+          trust_score: latest?.trust_score ?? null,
+          confidence: latest?.confidence ?? null,
+          last_seen: latest?.created_at ?? null,
+          flags: [
+            ...(traffic === 'RED' ? ['RED'] : []),
+            ...(hasC01 ? ['C01'] : []),
+            ...(hasA09 ? ['A09'] : []),
+          ],
+        });
+      }
+
+      const sector_breakdown = Array.from(sectorRed.entries())
+        .map(([sector, red_count]) => ({ sector, red_count }))
+        .sort((a,b) => b.red_count - a.red_count);
+
+      const sectorWarning = sector_breakdown.find(x => x.red_count >= 3);
+
+      let warning = null;
+      if (sectorWarning) {
+        warning = `⚠️ النظام يرصد هروب سيولة جماعي في هذا القطاع (${sectorWarning.sector}). أوقف أي مراكز جديدة وراجع خطة الخروج.`;
+      } else if (redCount >= 5) {
+        warning = '⚠️ النظام يرصد خطرًا جماعيًا في المحفظة. أوقف أي مراكز جديدة وراجع خطة الخروج.';
+      }
+
+      return res.json({
+        ok: true,
+        totals: { watchlist: items.length, red: redCount, c01: c01Count, a09: a09Count },
+        sector_breakdown,
+        warning,
+        items,
+        updated_at: new Date().toISOString(),
+      });
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: 'PORTFOLIO_HEALTH_FAILED', message_ar: 'تعذر تحليل صحة المحفظة.' });
+    }
+  });
+
+r.post('/watchlist', async (req, res) => {
+    const symbol = (req.body?.symbol || '').toString().trim().toUpperCase();
+    const market = (req.body?.market || '').toString().trim().toUpperCase();
+    if (!symbol || !['US','SA'].includes(market)) {
+      return res.status(400).json({ ok: false, error: 'INVALID_SYMBOL_OR_MARKET' });
+    }
+
+    const stockRow = await upsertStock(pool, { symbol, market });
+
+    await pool.query('INSERT INTO watchlist(stock_id) VALUES($1) ON CONFLICT (stock_id) DO NOTHING', [stockRow.id]);
+    res.json({ ok: true, data: stockRow });
+  });
+
+  // Alerts
+  r.get('/alerts', async (req, res) => {
+    const stockId = req.query.stockId ? Number(req.query.stockId) : null;
+    const params = [];
+    let where = '';
+    if (stockId) {
+      params.push(stockId);
+      where = `WHERE a.stock_id = $1`;
+    }
+
+    const { rows } = await pool.query(`
+      SELECT a.id, a.created_at, a.code, a.severity, a.title_ar, a.message_ar,
+             s.symbol, s.market, s.name,
+             a.snapshot_id
+      FROM alerts a
+      JOIN stocks s ON s.id = a.stock_id
+      ${where}
+      ORDER BY a.created_at DESC
+      LIMIT 200
+    `, params);
+
+    res.json({ ok: true, data: rows });
+  });
+
+  // Snapshots history (v1.4)
+  r.get('/snapshots', async (req, res) => {
+    const stockId = req.query.stockId ? Number(req.query.stockId) : null;
+    const limit = req.query.limit ? Math.max(1, Math.min(200, Number(req.query.limit))) : 30;
+    if (!stockId) return res.status(400).json({ ok: false, error: 'MISSING_STOCK_ID' });
+
+    const { rows } = await pool.query(
+      `SELECT id, stock_id, as_of, price, change_percent, volume, avg_volume20d,
+              rsi14, sma20, sma50, sma200, vol_ratio20,
+              pe, debt_equity, roe, op_margin,
+              trust_score, traffic,
+              tech_score, fund_score, sent_score
+       FROM stock_snapshots
+       WHERE stock_id = $1
+       ORDER BY as_of DESC
+       LIMIT $2`,
+      [stockId, limit]
+    );
+    res.json({ ok: true, data: rows });
+  });
+
+
+  // Quick Scan (v2.1) — single box: infer market + run both radars + return finalDecision
+  r.get('/scan', async (req, res) => {
+    let symbolRaw = (req.query.symbol || '').toString().trim();
+    let marketRaw = (req.query.market || '').toString().trim().toUpperCase();
+
+    if (!symbolRaw) return res.status(400).json({ ok: false, error: 'MISSING_SYMBOL' });
+
+    // Normalize + infer market
+    const infer = (s) => {
+      const t = String(s || '').trim().toUpperCase();
+      if (t.endsWith('.SR')) return { symbol: t, market: 'SA' };
+      if (/^\d{3,6}$/.test(t)) return { symbol: `${t}.SR`, market: 'SA' };
+      return { symbol: t, market: 'US' };
+    };
+
+    const inf = infer(symbolRaw);
+    const symbol = inf.symbol;
+    const market = (marketRaw === 'US' || marketRaw === 'SA') ? marketRaw : inf.market;
+    const tf = (req.query.tf || 'D').toString().trim().toUpperCase();
+
+    // Timeframes:
+    // - FREE: D / W
+    // - PRO : D / W / 1M / 5M  (Intraday is used for Pro-only signals like Iceberg)
+    if (!['D','W','1M','5M'].includes(tf)) {
+      return res.status(400).json({ ok:false, error:'TF_NOT_SUPPORTED', message_ar:'الإطارات المدعومة: D و W، وللوضع PRO أيضاً: 1M و 5M.' });
+    }
+
+    // Ensure stock exists
+    const stock = await upsertStock(pool, { symbol, market });
+
+    // Provider selection
+    const providerOverride = (req.query.provider || '').toString().trim().toLowerCase();
+    const chosen = providerOverride || (market === 'SA'
+      ? await getSetting('provider_sa', 'yahoo_free')
+      : await getSetting('provider_us', 'yahoo_free'));
+
+    // Provider key missing (in PRO/paid providers)
+    const hasFinnhub = !!String(process.env.FINNHUB_KEY || process.env.FINNHUB_API_KEY || '').trim();
+    const hasAlpha = !!String(process.env.ALPHA_VANTAGE_KEY || process.env.ALPHAVANTAGE_API_KEY || '').trim();
+    const hasEodhd = !!String(process.env.EODHD_KEY || process.env.EOD_HISTORICAL_DATA_KEY || '').trim();
+    if ((chosen === 'finnhub_paid' || chosen === 'finnhub') && !hasFinnhub) {
+      return res.status(400).json({ ok:false, error:'PROVIDER_KEY_MISSING', message_ar:'مفتاح Finnhub غير موجود. فعّل الوضع المجاني أو ضع المفتاح في Secrets.' });
+    }
+    if ((chosen === 'alphavantage_free' || chosen === 'alphavantage') && !hasAlpha) {
+      return res.status(400).json({ ok:false, error:'PROVIDER_KEY_MISSING', message_ar:'مفتاح AlphaVantage غير موجود. ضع المفتاح في Secrets أو استخدم Yahoo.' });
+    }
+    if (chosen === 'eodhd_paid' && !hasEodhd) {
+      return res.status(400).json({ ok:false, error:'PROVIDER_KEY_MISSING', message_ar:'مفتاح EODHD غير موجود. فعّل Yahoo/بيانات مجانية أو ضع المفتاح.' });
+    }
+
+    const risk_profile_q = (req.query.risk_profile || '').toString().trim().toLowerCase();
+    const risk_profile = (['conservative','balanced','aggressive'].includes(risk_profile_q) ? risk_profile_q : await getSetting('risk_profile', 'balanced'));
+
+    // v2.1.2+: position-aware decision
+    const owned = ['1','true','yes','y','on'].includes(String(req.query.owned || '').toLowerCase());
+    const exposureRaw = String(req.query.exposure || '').trim().toLowerCase();
+    const exposure = (exposureRaw === 'low' || exposureRaw === 'خفيف') ? 'LOW'
+      : (exposureRaw === 'high' || exposureRaw === 'عالي') ? 'HIGH'
+      : 'MED';
+
+    const data_mode_q = (req.query.data_mode || '').toString().trim().toLowerCase();
+    const data_mode = (data_mode_q === 'pro' || data_mode_q === 'paid') ? 'pro' : await getSetting('data_mode', 'free');
+
+    // Enforce intraday as PRO-only
+    const intradayTf = (tf === '1M' || tf === '5M');
+    if (intradayTf && data_mode !== 'pro') {
+      return res.status(403).json({ ok:false, error:'PRO_REQUIRED', message_ar:'إطار Intraday (1M/5M) متاح فقط في وضع PRO.' });
+    }
+
+
+    
+    // v3.4.3: Sentiment (manual/provider) — no scraping
+    const hype_score_q = req.query.hype_score != null ? Number(req.query.hype_score) : null;
+    const news_severity_q = req.query.news_severity != null ? Number(req.query.news_severity) : null;
+    const sentimentMode = String(req.query.sentiment_mode || 'manual').toLowerCase();
+    const manualOverride = (Number.isFinite(hype_score_q) && Number.isFinite(news_severity_q))
+      ? { hype_score: hype_score_q, news_severity: news_severity_q }
+      : null;
+    const sentiment = await getSentiment({ pool, symbol, market, mode: sentimentMode, manualOverride }).catch(() => ({ ok:false }));
+const analysis = await analyzeSymbol({
+      symbol,
+      market,
+      tf,
+      settings: {
+        riskProfile: risk_profile,
+        owned,
+        exposure,
+        data_mode,
+        // per-market provider, but FREE mode forces free-tier providers.
+        provider: chosen || 'yahoo_free'
+      }
+    });
+
+    // Persist snapshot + alerts like /analyze
+    
+    // No candles/data handling (clear user error)
+    const noData = analysis?.meta?.no_data || analysis?.meta?.no_candles || analysis?.meta?.provider_error === 'NO_DATA';
+    const price0 = Number(analysis?.quote?.price || analysis?.quote?.close || analysis?.meta?.last_price || 0);
+    const candlesCount = Number(analysis?.meta?.candles_count || analysis?.meta?.candlesCount || 0);
+    if (noData || (candlesCount === 0 && price0 === 0)) {
+      return res.status(404).json({ ok:false, error:'NO_DATA', message_ar:'لا توجد بيانات كافية لهذا الرمز/الإطار الزمني من المزود الحالي.' });
+    }
+const snapshot = await insertSnapshotFromAnalysis(pool, stock.id, analysis);
+
+    // v3.4: Persist analysis snapshot (decision history) for learning / backtesting-lite
+    const tfKey = (tf === 'W') ? 'W' : 'D';
+    const analysisSnapshot = await insertAnalysisSnapshotFromAnalysis(pool, stock.id, tfKey, analysis).catch(() => null);
+    const patternStats = analysisSnapshot ? await computePatternStats(pool, stock.id, tfKey, analysisSnapshot.pattern_key, analysis).catch(() => ({ available:false })) : { available:false };
+    // Attach historical stats to response (non-breaking)
+    analysis.history = { pattern: analysisSnapshot?.pattern_key || null, stats: patternStats };
+
+    // v3.4.2: Add History Analogies from decision journal (non-breaking)
+    const history_analogies = await getHistoryAnalogies(pool, stock.symbol, stock.market).catch(() => null);
+    if (history_analogies) analysis.history_analogies = history_analogies;
+    for (const a of (analysis.alerts || [])) {
+      await pool.query(
+        `INSERT INTO alerts(stock_id, snapshot_id, code, severity, title_ar, message_ar)
+         VALUES($1,$2,$3,$4,$5,$6)
+         ON CONFLICT DO NOTHING`,
+        [stock.id, snapshot.id, a.code, a.level || a.severity || 'MED', a.title || a.title_ar || '', a.message || a.message_ar || '']
+      ).catch(() => undefined);
+    }
+
+    const finalDecision = finalDecisionFromDecision(analysis.decision, analysis.opportunity, analysis.exit, owned, exposure, analysis);
+
+    res.json({
+      ok: true,
+      stockId: stock.id,
+      symbol,
+      market,
+      tf,
+      ...analysis,
+      position: { owned, exposure },
+      finalDecision
+    });
+  });
+
+  // Analyze
+  r.get('/analyze', analyzeLimiter, async (req, res) => {
+    const symbol = (req.query.symbol || '').toString().trim().toUpperCase();
+    const market = (req.query.market || '').toString().trim().toUpperCase();
+    const tf = (req.query.tf || 'D').toString().trim().toUpperCase();
+
+    // Timeframes:
+    // - FREE: D / W
+    // - PRO : D / W / 1M / 5M  (Intraday is used for Pro-only signals like Iceberg)
+    if (!['D','W','1M','5M'].includes(tf)) {
+      return res.status(400).json({ ok:false, error:'TF_NOT_SUPPORTED', message_ar:'الإطارات المدعومة: D و W، وللوضع PRO أيضاً: 1M و 5M.' });
+    }
+
+
+    if (!symbol || !['US','SA'].includes(market)) {
+      return res.status(400).json({ ok: false, error: 'INVALID_SYMBOL_OR_MARKET' });
+    }
+
+    // Ensure stock exists
+    const stock = await upsertStock(pool, { symbol, market });
+
+    // Provider selection: per-market setting + optional override via query param
+    const providerOverride = (req.query.provider || '').toString().trim().toLowerCase();
+    const chosen = providerOverride || (market === 'SA'
+      ? await getSetting('provider_sa', 'yahoo_free')
+      : await getSetting('provider_us', 'yahoo_free'));
+
+
+    // Provider key missing (in PRO/paid providers) — unified with /api/scan
+    const hasFinnhub = !!String(process.env.FINNHUB_KEY || process.env.FINNHUB_API_KEY || '').trim();
+    const hasAlpha = !!String(process.env.ALPHA_VANTAGE_KEY || process.env.ALPHAVANTAGE_API_KEY || '').trim();
+    const hasEodhd = !!String(process.env.EODHD_KEY || process.env.EOD_HISTORICAL_DATA_KEY || '').trim();
+    if ((chosen === 'finnhub_paid' || chosen === 'finnhub') && !hasFinnhub) {
+      return res.status(400).json({ ok:false, error:'PROVIDER_KEY_MISSING', message_ar:'مفتاح Finnhub غير موجود. فعّل الوضع المجاني أو ضع المفتاح في Secrets.' });
+    }
+    if ((chosen === 'alphavantage_free' || chosen === 'alphavantage') && !hasAlpha) {
+      return res.status(400).json({ ok:false, error:'PROVIDER_KEY_MISSING', message_ar:'مفتاح AlphaVantage غير موجود. ضع المفتاح في Secrets أو استخدم Yahoo.' });
+    }
+    if (chosen === 'eodhd_paid' && !hasEodhd) {
+      return res.status(400).json({ ok:false, error:'PROVIDER_KEY_MISSING', message_ar:'مفتاح EODHD غير موجود. فعّل Yahoo/بيانات مجانية أو ضع المفتاح.' });
+    }
+
+        const risk_profile_q = (req.query.risk_profile || '').toString().trim().toLowerCase();
+    const risk_profile = (['conservative','balanced','aggressive'].includes(risk_profile_q) ? risk_profile_q : await getSetting('risk_profile', 'balanced'));
+
+    // v2.1.2+: position-aware decision
+    const owned = ['1','true','yes','y','on'].includes(String(req.query.owned || '').toLowerCase());
+    const exposureRaw = String(req.query.exposure || '').trim().toLowerCase();
+    const exposure = (exposureRaw === 'low' || exposureRaw === 'خفيف') ? 'LOW'
+      : (exposureRaw === 'high' || exposureRaw === 'عالي') ? 'HIGH'
+      : 'MED';
+
+    const data_mode_q = (req.query.data_mode || '').toString().trim().toLowerCase();
+    const data_mode = (data_mode_q === 'pro' || data_mode_q === 'paid') ? 'pro' : await getSetting('data_mode', 'free');
+
+    // Enforce intraday as PRO-only
+    const intradayTf = (tf === '1M' || tf === '5M');
+    if (intradayTf && data_mode !== 'pro') {
+      return res.status(403).json({ ok:false, error:'PRO_REQUIRED', message_ar:'إطار Intraday (1M/5M) متاح فقط في وضع PRO.' });
+    }
+
+
+const analysis = await withProviderEnvLock(async () => {
+      const prevProvider = process.env.STOCK_PROVIDER;
+      process.env.STOCK_PROVIDER = String(chosen || 'yahoo_free');
+      try {
+        return await analyzeSymbol({
+          symbol,
+          market,
+          tf,
+          settings: {
+            riskProfile: risk_profile,
+            owned,
+            exposure,
+            data_mode,
+            provider: chosen || 'yahoo_free'
+          }
+        });
+      } finally {
+        process.env.STOCK_PROVIDER = prevProvider;
+      }
+    });
+
+    // Per-session scratch (multi-user isolation)
+    try {
+      if (req.session && req.session.msar) {
+        req.session.msar.last = { symbol, market, tf, at: Date.now() };
+      }
+    } catch (_) {}
+
+    // No candles/data handling (clear user error) — unified with /api/scan
+    const noData = analysis?.meta?.no_data || analysis?.meta?.no_candles || analysis?.meta?.provider_error === 'NO_DATA';
+    const price0 = Number(analysis?.quote?.price || analysis?.quote?.close || analysis?.meta?.last_price || 0);
+    const candlesCount = Number(analysis?.meta?.candles_count || analysis?.meta?.candlesCount || 0);
+    if (noData || (candlesCount === 0 && price0 === 0)) {
+      return res.status(404).json({ ok:false, error:'NO_DATA', message_ar:'لا توجد بيانات كافية لهذا الرمز/الإطار الزمني من المزود الحالي.' });
+    }
+
+
+    // Persist snapshot
+    const snapshot = await insertSnapshotFromAnalysis(pool, stock.id, analysis);
+
+    // Persist alerts (dedupe per snapshot+code)
+    for (const a of analysis.alerts) {
+      await pool.query(
+        `INSERT INTO alerts(stock_id, snapshot_id, code, severity, title_ar, message_ar)
+         VALUES($1,$2,$3,$4,$5,$6)
+         ON CONFLICT DO NOTHING`,
+        [stock.id, snapshot.id, a.code, a.level || a.severity || 'MED', a.title || a.title_ar || '', a.message || a.message_ar || '']
+      ).catch(() => undefined);
+    }
+
+    res.json({
+      ok: true,
+      stockId: stock.id,
+      symbol: stock.symbol,
+      market: stock.market,
+      tf,
+      quote: {
+        price: Number(snapshot.price),
+        changePercent: Number(snapshot.change_percent),
+        volume: Number(snapshot.volume),
+      },
+      indicators: analysis.indicators,
+      fundamentals: analysis.fundamentals,
+      // Radars
+      score: analysis.score,
+      traffic: analysis.traffic,
+      smf: analysis.smf,
+      institutionalFlow: analysis.institutionalFlow,
+      sectorValuation: analysis.sectorValuation,
+      earningsGrowth: analysis.earningsGrowth,
+      earningsQuality: analysis.earningsQuality,
+      volumeAnomaly: analysis.volumeAnomaly,
+
+      // Decision Support
+      decision: analysis.decision,
+      opportunity: analysis.opportunity,
+      exit: analysis.exit,
+      position: { owned, exposure },
+      finalDecision: finalDecisionFromDecision(analysis.decision, analysis.opportunity, analysis.exit, owned, exposure, analysis),
+
+      // Alerts & explainability
+      alerts: analysis.alerts,
+      reasons: analysis.reasons,
+      reasonsByAxis: analysis.reasonsByAxis,
+      scoreBreakdown: analysis.scoreBreakdown,
+      meta: { ...(analysis.meta || {}), data_mode: analysis.meta?.data_mode || analysis.data_mode || analysis.settings?.data_mode || analysis.meta?.mode || null },
+    });
+  });
+
+  // Demo seed
+  r.post('/demo/seed', demoSeedLimiter, async (_req, res) => {
+    const result = await seedDemo(pool);
+    res.json({ ok: true, data: result });
+  });
+
+  return r;
+}
+
+async function upsertStock(pool, { symbol, market }) {
+  const defaults = {
+    name: symbol === 'AAPL' ? 'Apple Inc.' : symbol === '2222.SR' ? 'أرامكو السعودية' : (symbol === 'DUMP' ? 'سهم وهمي (DUMP)' : symbol),
+    currency: market === 'US' ? 'USD' : 'SAR'
+  };
+
+  const { rows } = await pool.query(
+    `INSERT INTO stocks(symbol, market, name, currency)
+     VALUES($1,$2,$3,$4)
+     ON CONFLICT(symbol, market)
+     DO UPDATE SET name=EXCLUDED.name, currency=EXCLUDED.currency
+     RETURNING id, symbol, market, name, currency, created_at`,
+    [symbol, market, defaults.name, defaults.currency]
+  );
+  return rows[0];
+}
+
+async function createNeutralSnapshot(pool, stockId, symbol, market) {
+  // Neutral placeholder if no provider is connected
+  const now = new Date();
+  const basePrice = symbol === 'AAPL' ? 180 : symbol === '2222.SR' ? 31 : 10;
+  const change = symbol === 'AAPL' ? 0.6 : symbol === '2222.SR' ? 0.3 : 1.0;
+  const volume = symbol === 'AAPL' ? 52000000 : symbol === '2222.SR' ? 5400000 : 9000000;
+  const avgVol = symbol === 'AAPL' ? 48000000 : symbol === '2222.SR' ? 6500000 : 12000000;
+  const rsi = symbol === 'AAPL' ? 58 : symbol === '2222.SR' ? 62 : 74;
+  const sma20 = symbol === 'AAPL' ? 176 : symbol === '2222.SR' ? 30.8 : 8.0;
+  const sma200 = symbol === 'AAPL' ? 165 : symbol === '2222.SR' ? 30.1 : 9.5;
+
+  // basic fundamentals placeholders
+  const pe = symbol === 'AAPL' ? 28.5 : symbol === '2222.SR' ? 16.5 : 120;
+  const debtEq = symbol === 'AAPL' ? 1.8 : symbol === '2222.SR' ? 0.25 : 3.5;
+  const roe = symbol === 'AAPL' ? 120 : symbol === '2222.SR' ? 18.2 : -10;
+  const opMargin = symbol === 'AAPL' ? 30 : symbol === '2222.SR' ? 12.1 : -5;
+
+  // initial trust/traffic will be recomputed in /analyze
+  const trust = 60;
+  const traffic = 'YELLOW';
+
+  const { rows } = await pool.query(
+    `INSERT INTO stock_snapshots(
+      stock_id, as_of, price, change_percent, volume, avg_volume20d,
+      rsi14, sma20, sma200, vol_ratio20,
+      pe, debt_equity, roe, op_margin,
+      trust_score, traffic, data_quality_json
+    ) VALUES(
+      $1,$2,$3,$4,$5,$6,
+      $7,$8,$9,$10,
+      $11,$12,$13,$14,
+      $15,$16,$17
+    ) RETURNING *`,
+    [
+      stockId, now, basePrice, change, volume, avgVol,
+      rsi, sma20, sma200, Number((volume / avgVol).toFixed(2)),
+      pe, debtEq, roe, opMargin,
+      trust, traffic
+    ]
+  );
+  return rows[0];
+}
+
+
+
+async function logDecisionJournal(pool, symbol, market, tf, analysis, checkAfterDays = 5) {
+  const q = analysis?.quote || {};
+  const entryPrice = Number(q.price ?? q.close ?? 0) || 0;
+
+  const traffic = analysis?.traffic || null;
+  const trust = Number(analysis?.score ?? null);
+  const confidence = analysis?.confidence || analysis?.meta?.confidence || null;
+  const regime = analysis?.regime || analysis?.meta?.regime || null;
+  const trendConfirmed = Boolean(analysis?.trend_confirmed ?? analysis?.meta?.trend_confirmed ?? false);
+
+  const alerts = analysis?.alerts || [];
+  const clusters = analysis?.clusters || [];
+  const assistant = analysis?.assistant || null;
+
+  const row = await pool.query(
+    `INSERT INTO decision_journal(
+      symbol, market, tf, traffic, trust_score, confidence, regime, trend_confirmed,
+      alerts_json, clusters_json, assistant_json, entry_price, check_after_days, data_quality_json
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11::jsonb,$12,$13,$14::jsonb)
+    RETURNING *`,
+    [
+      String(symbol).toUpperCase(),
+      String(market).toUpperCase(),
+      String(tf).toUpperCase() === 'W' ? 'W' : 'D',
+      traffic,
+      Number.isFinite(trust) ? trust : null,
+      confidence,
+      regime,
+      trendConfirmed,
+      JSON.stringify(alerts),
+      JSON.stringify(clusters),
+      JSON.stringify(assistant),
+      entryPrice || null,
+      Math.max(1, Number(checkAfterDays || 5))
+    ]
+  );
+  return row.rows?.[0];
+}
+
+async function getHistoryAnalogies(pool, symbol, market) {
+  // last 5 C01 + A01 outcomes (if available)
+  const out = { c01: [], a01: [] };
+
+  const q1 = await pool.query(
+    `SELECT created_at, entry_price, future_change_pct, outcome_label
+     FROM decision_journal
+     WHERE symbol=$1 AND market=$2
+       AND clusters_json @> '[{"code":"C01"}]'::jsonb
+       AND outcome_label IS NOT NULL
+     ORDER BY created_at DESC
+     LIMIT 5`,
+    [String(symbol).toUpperCase(), String(market).toUpperCase()]
+  );
+  out.c01 = q1.rows || [];
+
+  const q2 = await pool.query(
+    `SELECT created_at, entry_price, future_change_pct, outcome_label
+     FROM decision_journal
+     WHERE symbol=$1 AND market=$2
+       AND alerts_json @> '[{"code":"A01"}]'::jsonb
+       AND outcome_label IS NOT NULL
+     ORDER BY created_at DESC
+     LIMIT 5`,
+    [String(symbol).toUpperCase(), String(market).toUpperCase()]
+  );
+  out.a01 = q2.rows || [];
+
+  return out;
+}
+
+function buildPatternKey(analysis) {
+  const alertCodes = (analysis?.alerts || []).map(a => String(a.code || a)).filter(Boolean);
+  const clusterCodes = (analysis?.clusters || []).map(c => String(c.code || c)).filter(Boolean);
+  const all = [...clusterCodes.map(c => `C:${c}`), ...alertCodes.map(a => `A:${a}`)].sort();
+  return all.join('|') || 'NONE';
+}
+
+async function insertAnalysisSnapshotFromAnalysis(pool, stockId, tf, analysis) {
+  const q = analysis.quote || {};
+  const price = Number(q.price ?? q.close ?? analysis?.meta?.last_price ?? 0) || 0;
+  const patternKey = buildPatternKey(analysis);
+  const rs = analysis?.meta?.relativeStrength || analysis?.relativeStrength || {};
+  const sg = analysis?.meta?.sectorGuard || analysis?.sectorGuard || {};
+
+  const rsDelta = rs && rs.available ? Number(rs.rs_delta_pct ?? null) : null;
+  const rsLabel = rs && rs.available ? String(rs.label ?? '') : null;
+
+  const secDelta = sg && sg.available ? Number(sg.stock_vs_sector_delta_pct ?? null) : null;
+  const secLabel = sg && sg.available ? String(sg.label ?? '') : null;
+
+  const assistant = analysis?.assistant || null;
+  const reasons = analysis?.reasons || [];
+
+  const row = await pool.query(
+    `INSERT INTO analysis_snapshots(
+      stock_id, tf, as_of, price, trust_score, traffic, regime, trend_confirmed, confidence,
+      pattern_key, rs_delta_pct, rs_label, sector_delta_pct, sector_label,
+      alerts, clusters, assistant, reasons
+    )
+    VALUES (
+      $1, $2, NOW()::DATE, $3, $4, $5, $6, $7, $8,
+      $9, $10, $11, $12, $13,
+      $14::jsonb, $15::jsonb, $16::jsonb, $17::jsonb
+    )
+    ON CONFLICT (stock_id, tf, as_of)
+    DO UPDATE SET
+      price = EXCLUDED.price,
+      trust_score = EXCLUDED.trust_score,
+      traffic = EXCLUDED.traffic,
+      regime = EXCLUDED.regime,
+      trend_confirmed = EXCLUDED.trend_confirmed,
+      confidence = EXCLUDED.confidence,
+      pattern_key = EXCLUDED.pattern_key,
+      rs_delta_pct = EXCLUDED.rs_delta_pct,
+      rs_label = EXCLUDED.rs_label,
+      sector_delta_pct = EXCLUDED.sector_delta_pct,
+      sector_label = EXCLUDED.sector_label,
+      alerts = EXCLUDED.alerts,
+      clusters = EXCLUDED.clusters,
+      assistant = EXCLUDED.assistant,
+      reasons = EXCLUDED.reasons
+    RETURNING *`,
+    [
+      stockId,
+      tf,
+      price,
+      Number(analysis.score ?? null),
+      analysis.traffic ?? null,
+      analysis.regime ?? analysis?.meta?.regime ?? null,
+      Boolean(analysis.trend_confirmed ?? analysis?.meta?.trend_confirmed ?? false),
+      analysis.confidence ?? analysis?.meta?.confidence ?? null,
+      patternKey,
+      rsDelta,
+      rsLabel,
+      secDelta,
+      secLabel,
+      JSON.stringify(analysis.alerts || []),
+      JSON.stringify(analysis.clusters || []),
+      JSON.stringify(assistant),
+      JSON.stringify(reasons || [])
+    ]
+  );
+  return row.rows?.[0];
+}
+
+
+async function computePatternStats(pool, stockId, tf, patternKey, analysisForSimilarity = null) {
+  const horizonDays = tf === 'W' ? 28 : 7;
+
+  // Pull recent snapshots once (ascending) to compute forward returns in-memory.
+  const all = await pool.query(
+    `SELECT as_of, price, pattern_key, traffic, regime, alerts, clusters
+     FROM analysis_snapshots
+     WHERE stock_id=$1 AND tf=$2
+     ORDER BY as_of ASC
+     LIMIT 600`,
+    [stockId, tf]
+  );
+  const rows = all.rows || [];
+  if (rows.length < 10) return { available: false, sample: rows.length };
+
+  const dates = rows.map(r => new Date(r.as_of).getTime());
+  const prices = rows.map(r => Number(r.price || 0));
+
+  function forwardReturnPct(i) {
+    const t0 = dates[i];
+    const target = t0 + horizonDays * 86400000;
+    // find first index with date >= target
+    let j = i + 1;
+    // binary search on dates
+    j = dates.findIndex((t, idx) => idx > i && t >= target);
+    if (j === -1) return null;
+    const p0 = prices[i], p1 = prices[j];
+    if (!p0 || !p1) return null;
+    return ((p1 - p0) / p0) * 100;
+  }
+
+  function codesFromJSON(x) {
+    try {
+      const arr = Array.isArray(x) ? x : (x ? JSON.parse(x) : []);
+      return (arr || []).map(a => String(a.code || a)).filter(Boolean);
+    } catch {
+      return [];
+    }
+  }
+
+  function buildSetFromRow(r) {
+    const a = codesFromJSON(r.alerts).map(c => `A:${c}`);
+    const c = codesFromJSON(r.clusters).map(c => `C:${c}`);
+    return new Set([...a, ...c]);
+  }
+
+  function jaccard(setA, setB) {
+    let inter = 0;
+    for (const v of setA) if (setB.has(v)) inter++;
+    const union = setA.size + setB.size - inter;
+    return union === 0 ? 0 : inter / union;
+  }
+
+  // 1) Exact match if patternKey provided and has enough occurrences
+  let exactIdx = [];
+  if (patternKey && patternKey !== 'NONE') {
+    exactIdx = rows
+      .map((r, i) => ({ r, i }))
+      .filter(x => x.r.pattern_key === patternKey)
+      .map(x => x.i);
+  }
+
+  function computeStatsFromIdx(idxs) {
+    const rets = [];
+    for (const i of idxs) {
+      const rr = forwardReturnPct(i);
+      if (rr == null) continue;
+      rets.push(rr);
+    }
+    if (rets.length < 3) return null;
+    const avg = rets.reduce((a, b) => a + b, 0) / rets.length;
+    const wins = rets.filter(x => x > 0).length;
+    return {
+      available: true,
+      horizon_days: horizonDays,
+      occurrences: idxs.length,
+      matched: rets.length,
+      avg_return_pct: Math.round(avg * 100) / 100,
+      win_rate: Math.round((wins / rets.length) * 1000) / 10,
+      best_return_pct: Math.round(Math.max(...rets) * 100) / 100,
+      worst_return_pct: Math.round(Math.min(...rets) * 100) / 100
+    };
+  }
+
+  const exactStats = exactIdx.length >= 5 ? computeStatsFromIdx(exactIdx) : null;
+  if (exactStats) {
+    return { mode: 'EXACT', pattern_key: patternKey, ...exactStats };
+  }
+
+  // 2) Fuzzy similarity fallback (reduces cold-start + robust patterns)
+  // Similarity rules (MVP):
+  // - same traffic OR same regime
+  // - alert/cluster overlap Jaccard >= 0.45
+  // - prefer recent 250 rows
+  if (!analysisForSimilarity) {
+    return { available: false, mode: 'EXACT', pattern_key: patternKey, sample: rows.length, note_ar: 'لا يوجد سجل كافٍ لنفس النمط بعد.' };
+  }
+
+  const targetTraffic = analysisForSimilarity.traffic || null;
+  const targetRegime = analysisForSimilarity.regime || analysisForSimilarity?.meta?.regime || null;
+  const targetSet = (() => {
+    const a = (analysisForSimilarity.alerts || []).map(x => `A:${x.code || x}`);
+    const c = (analysisForSimilarity.clusters || []).map(x => `C:${x.code || x}`);
+    return new Set([...a, ...c]);
+  })();
+
+  const start = Math.max(0, rows.length - 250);
+  const idxs = [];
+  for (let i = start; i < rows.length; i++) {
+    const r = rows[i];
+    if (targetTraffic && r.traffic && r.traffic !== targetTraffic && (!targetRegime || r.regime !== targetRegime)) continue;
+    if (targetRegime && r.regime && r.regime !== targetRegime && (!targetTraffic || r.traffic !== targetTraffic)) continue;
+    const setR = buildSetFromRow(r);
+    const sim = jaccard(targetSet, setR);
+    if (sim >= 0.45) idxs.push(i);
+  }
+
+  const fuzzyStats = idxs.length >= 6 ? computeStatsFromIdx(idxs) : null;
+  if (!fuzzyStats) {
+    return { available: false, mode: 'FUZZY', pattern_key: patternKey, sample: rows.length, matched: idxs.length, note_ar: 'لا يوجد سجل كافٍ لنمط مشابه حتى الآن.' };
+  }
+  return { mode: 'FUZZY', pattern_key: patternKey, similarity_threshold: 0.45, ...fuzzyStats };
+}
+
+async function insertSnapshotFromAnalysis(pool, stockId, analysis) {
+  const q = analysis.quote || {};
+  const i = analysis.indicators || {};
+  const f = analysis.fundamentals || {};
+
+  const price = Number(q.price ?? 0) || 0;
+  const change = Number(q.change_percent ?? q.changePercent ?? 0) || 0;
+  const volume = Number(q.volume ?? 0) || 0;
+  const volRatio = Number(i.vol_ratio20 ?? 1) || 1;
+  const avgVol20 = volRatio > 0 ? Math.round(volume / volRatio) : volume;
+
+  const r = await pool.query(
+    `INSERT INTO stock_snapshots(
+      stock_id, as_of, price, change_percent, volume, avg_volume20d,
+      rsi14, sma20, sma50, sma200, ema20, atr14, bb_upper, bb_lower, macd, macd_signal, macd_hist, vol_ratio20,
+      pe, debt_equity, roe, op_margin,
+      trust_score, traffic,
+      tech_score, fund_score, sent_score,
+      smf_available, smf_score, smf_signal,
+      institutional_score, institutional_signal,
+      institutional_vwap, institutional_delta,
+      sector_valuation,
+      earnings_quality_score,
+      earnings_growth_score, earnings_growth_signal,
+      volume_anomaly_score, volume_anomaly_flag
+    ) VALUES (
+      $1, NOW(), $2, $3, $4, $5,
+      $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+      $18, $19, $20, $21,
+      $22, $23,
+      $24, $25, $26,
+      $27, $28, $29,
+      $30, $31,
+      $32, $33,
+      $34,
+      $35,
+      $36, $37,
+      $38, $39
+    ) RETURNING *`,
+    [
+      stockId,
+      price,
+      change,
+      volume,
+      avgVol20,
+      Number(i.rsi14 ?? 50),
+      Number(i.sma20 ?? price),
+      i.sma50 ?? null,
+      Number(i.sma200 ?? price),
+      i.ema20 ?? null,
+      i.atr14 ?? null,
+      i.bb_upper ?? null,
+      i.bb_lower ?? null,
+      i.macd ?? null,
+      i.macd_signal ?? null,
+      i.macd_hist ?? null,
+      Number(i.vol_ratio20 ?? 1),
+      f.pe ?? null,
+      f.debt_equity ?? null,
+      f.roe ?? null,
+      f.operating_margin ?? f.op_margin ?? null,
+      Number(analysis.score ?? 50),
+      analysis.traffic ?? 'YELLOW',
+      Number(analysis.scoreBreakdown?.technical ?? null),
+      Number(analysis.scoreBreakdown?.fundamentals ?? null),
+      Number(analysis.scoreBreakdown?.sentiment ?? null),
+
+      Boolean(analysis.smf?.available ?? false),
+      analysis.smf?.score ?? null,
+      analysis.smf?.signal ?? null,
+
+      analysis.institutionalFlow?.score ?? null,
+      analysis.institutionalFlow?.signal ?? null,
+
+      analysis.institutionalFlow?.vwap ?? null,
+      analysis.institutionalFlow?.delta ?? null,
+
+      analysis.sectorValuation?.valuation ?? null,
+      analysis.earningsQuality?.qualityScore ?? null,
+      analysis.earningsGrowth?.available ? (analysis.earningsGrowth.score ?? null) : null,
+      analysis.earningsGrowth?.available ? (analysis.earningsGrowth.signal ?? null) : null,
+      analysis.volumeAnomaly?.score ?? null,
+      analysis.volumeAnomaly?.flag ?? null,
+    ]
+  );
+  return r.rows[0];
+}
+
+async function seedDemo(pool) {
+  // Ensure schema exists
+  // (Expect user ran schema.sql; but we do a minimal safeguard by attempting creates)
+  // We'll try to create tables if missing.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS stocks (
+      id SERIAL PRIMARY KEY,
+      symbol TEXT NOT NULL,
+      market TEXT NOT NULL CHECK (market IN ('US','SA')),
+      name TEXT NOT NULL,
+      currency TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(symbol, market)
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS stock_snapshots (
+      id SERIAL PRIMARY KEY,
+      stock_id INT NOT NULL REFERENCES stocks(id) ON DELETE CASCADE,
+      as_of TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      price NUMERIC(18,6) NOT NULL,
+      change_percent NUMERIC(10,4) NOT NULL,
+      volume BIGINT NOT NULL,
+      avg_volume20d BIGINT NOT NULL,
+      rsi14 NUMERIC(10,4) NOT NULL,
+      sma20 NUMERIC(18,6) NOT NULL,
+      sma200 NUMERIC(18,6) NOT NULL,
+      vol_ratio20 NUMERIC(10,4) NOT NULL,
+      pe NUMERIC(12,4),
+      debt_equity NUMERIC(12,4),
+      roe NUMERIC(12,4),
+      op_margin NUMERIC(12,4),
+      trust_score INT NOT NULL,
+      traffic TEXT NOT NULL CHECK (traffic IN ('GREEN','YELLOW','RED'))
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS alerts (
+      id SERIAL PRIMARY KEY,
+      stock_id INT NOT NULL REFERENCES stocks(id) ON DELETE CASCADE,
+      snapshot_id INT REFERENCES stock_snapshots(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      code TEXT NOT NULL,
+      severity TEXT NOT NULL,
+      title_ar TEXT NOT NULL,
+      message_ar TEXT NOT NULL
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS watchlist (
+      id SERIAL PRIMARY KEY,
+      stock_id INT NOT NULL REFERENCES stocks(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(stock_id)
+    );
+  `);
+
+  // Upsert the three demo stocks
+  const aapl = await upsertStock(pool, { symbol: 'AAPL', market: 'US' });
+  const aramco = await upsertStock(pool, { symbol: '2222.SR', market: 'SA' });
+  const dump = await upsertStock(pool, { symbol: 'DUMP', market: 'US' });
+
+  // Put them on watchlist
+  await pool.query('INSERT INTO watchlist(stock_id) VALUES($1) ON CONFLICT (stock_id) DO NOTHING', [aapl.id]);
+  await pool.query('INSERT INTO watchlist(stock_id) VALUES($1) ON CONFLICT (stock_id) DO NOTHING', [aramco.id]);
+  await pool.query('INSERT INTO watchlist(stock_id) VALUES($1) ON CONFLICT (stock_id) DO NOTHING', [dump.id]);
+
+  // Clean previous demo snapshots/alerts (for a clean demo)
+  await pool.query('DELETE FROM alerts WHERE stock_id IN ($1,$2,$3)', [aapl.id, aramco.id, dump.id]);
+  await pool.query('DELETE FROM stock_snapshots WHERE stock_id IN ($1,$2,$3)', [aapl.id, aramco.id, dump.id]);
+
+  // Create snapshots crafted to show traffic states
+  const now = new Date();
+
+  // AAPL (Safe)
+  const aaplSnap = await pool.query(
+    `INSERT INTO stock_snapshots(stock_id, as_of, price, change_percent, volume, avg_volume20d, rsi14, sma20, sma200, vol_ratio20, pe, debt_equity, roe, op_margin, trust_score, traffic)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+     RETURNING *`,
+    [aapl.id, now, 180.12, 0.6, 52000000, 48000000, 58, 176.20, 165.40, 1.08, 28.5, 1.8, 120, 30, 88, 'GREEN']
+  );
+
+  // 2222.SR (Neutral)
+  const aramcoSnap = await pool.query(
+    `INSERT INTO stock_snapshots(stock_id, as_of, price, change_percent, volume, avg_volume20d, rsi14, sma20, sma200, vol_ratio20, pe, debt_equity, roe, op_margin, trust_score, traffic)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+     RETURNING *`,
+    [aramco.id, now, 31.20, 0.5, 5400000, 6500000, 62, 30.80, 30.10, 0.83, 16.5, 0.25, 18.2, 12.1, 70, 'YELLOW']
+  );
+
+  // DUMP (Danger) crafted to trigger A01 + A03 + A02 + A04
+  // - change% > 4 AND volume < avgVol => A01
+  // - price / sma20 > 1.15 => A03
+  // - force divergence => A02
+  // - A04 will show if UI uses hype/noOfficial OR we create it explicitly here.
+  const dumpSnap = await pool.query(
+    `INSERT INTO stock_snapshots(stock_id, as_of, price, change_percent, volume, avg_volume20d, rsi14, sma20, sma200, vol_ratio20, pe, debt_equity, roe, op_margin, trust_score, traffic)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+     RETURNING *`,
+    [dump.id, now, 11.50, 9.2, 900000, 3500000, 78, 9.50, 10.80, 0.26, 120, 3.5, -10, -5, 22, 'RED']
+  );
+
+  // Insert alerts explicitly for guaranteed demo visibility (v1.6 includes A05–A07)
+  const dumpSnapshotId = dumpSnap.rows[0].id;
+  const alerts = [
+    ['A01','HIGH','فخ الصعود الكاذب (Volume-Price Trap)','صعود قوي مع حجم أقل من متوسط 20 يوم — قد يكون تضخيمًا.'],
+    ['A02','HIGH','انحراف زخم سلبي (Bearish Divergence)','السعر سجّل قمة أعلى بينما RSI سجّل قمة أقل — احتمال انعكاس.'],
+    ['A03','HIGH','انفجار الفقاعة (Overextended)','السعر بعيد عن SMA20 بأكثر من 15% — احتمال تصحيح مرتفع.'],
+    ['A04','MED','التلاعب الإخباري (Sentiment vs Reality)','ضجيج اجتماعي مرتفع بدون إفصاح رسمي — انتبه من التلاعب.'],
+    ['A05','HIGH','رادار السيولة الذكية (Smart Money)','إشارة تصريف قوية من SMF — قد يكون خروج سيولة كبيرة.'],
+    ['A06','MED','تطبيل/ضجيج اجتماعي','ضجيج سوشيال بدون إفصاح رسمي — احتمال تضخيم.'],
+    ['A07','MED','شذوذ في السيولة','قفزة غير طبيعية في حجم التداول مع حركة سعر — راقب احتمال تلاعب.']
+  ];
+
+  for (const a of alerts) {
+    await pool.query(
+      `INSERT INTO alerts(stock_id, snapshot_id, code, severity, title_ar, message_ar)
+       VALUES($1,$2,$3,$4,$5,$6)`,
+      [dump.id, dumpSnapshotId, a[0], a[1], a[2], a[3]]
+    );
+  }
+
+  return {
+    stocks: [aapl, aramco, dump],
+    snapshots: {
+      AAPL: aaplSnap.rows[0].id,
+      '2222.SR': aramcoSnap.rows[0].id,
+      DUMP: dumpSnapshotId
+    }
+  };
+}

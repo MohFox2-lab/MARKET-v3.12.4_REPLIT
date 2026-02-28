@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Market Sentinel AR — حماية المحفظة (v3.12.4)</title>
+
+  <!-- Tailwind (CDN) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- Arabic font (Tajawal) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&display=swap" rel="stylesheet">
+
+  <style>
+    body { font-family: 'Tajawal', system-ui, -apple-system, Segoe UI, Arial, sans-serif; }
+    :root{
+      --c-primary:#4DA3FF;
+      --c-green:#3DDC97;
+      --c-purple:#B388FF;
+      --c-ink:#0f172a;
+      --c-muted:#64748b;
+      --c-border:#e2e8f0;
+      --c-surface:#ffffff;
+      --c-surface2:#f8fafc;
+    }
+    .ms-chip{display:inline-flex;align-items:center;gap:.35rem;padding:.15rem .5rem;border-radius:999px;font-weight:800;font-size:11px;}
+    .ms-chip.blue{background:rgba(77,163,255,.12);color:#0b2a4a;border:1px solid rgba(77,163,255,.28)}
+    .ms-chip.green{background:rgba(61,220,151,.12);color:#06402b;border:1px solid rgba(61,220,151,.28)}
+    .ms-chip.purple{background:rgba(179,136,255,.14);color:#2a0b5a;border:1px solid rgba(179,136,255,.30)}
+
+    /* Tabs: color-coded by route */
+    .tab{transition:all .15s ease;border-color:var(--c-border);background:var(--c-surface);color:#334155;}
+    .tab:hover{background:var(--c-surface2)}
+    .tab.is-active{color:#fff;border-color:transparent;box-shadow:0 10px 20px rgba(15,23,42,.08)}
+    .tab[data-route='dashboard'].is-active{background:var(--c-primary)}
+    .tab[data-route='add'].is-active{background:var(--c-green)}
+    .tab[data-route='alerts'].is-active{background:var(--c-purple)}
+    .tab[data-route='liquidity'].is-active{background:var(--c-green)}
+    .tab[data-route='news'].is-active{background:var(--c-purple)}
+    .tab[data-route='settings'].is-active{background:var(--c-primary)}
+    .tab[data-route='screener'].is-active{background:var(--c-purple)}
+    .tab[data-route='catalog'].is-active{background:var(--c-green)}
+
+    /* Soft accents helpers */
+    .ms-btn-primary{background:var(--c-primary);color:#fff;}
+    .ms-btn-primary:hover{filter:brightness(.97)}
+    .ms-btn-green{background:var(--c-green);color:#fff;}
+    .ms-btn-purple{background:var(--c-purple);color:#fff;}
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+<link rel="stylesheet" href="./light-theme.css">
+
+<style id="ms-gate-style">
+  body.ms-locked { overflow: hidden; }
+  body.ms-locked #ms-app-root { filter: blur(2px); pointer-events: none; user-select: none; }
+  #ms-gate-overlay {
+    position: fixed; inset: 0; z-index: 99999;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(244,246,249,0.92);
+    backdrop-filter: blur(6px);
+  }
+  #ms-gate-card {
+    width: min(520px, calc(100vw - 32px));
+    background: #fff;
+    border: 1px solid rgba(17, 24, 39, 0.10);
+    border-radius: 18px;
+    box-shadow: 0 16px 40px rgba(0,0,0,0.10);
+    padding: 22px;
+  }
+  #ms-gate-title { font-size: 20px; font-weight: 800; color: #111827; margin-bottom: 6px; }
+  #ms-gate-sub { font-size: 14px; color: #6b7280; margin-bottom: 14px; line-height: 1.6; }
+  #ms-gate-input {
+    width: 100%; padding: 12px 14px; border-radius: 12px;
+    border: 1px solid rgba(17,24,39,0.12);
+    outline: none; font-size: 16px;
+  }
+  #ms-gate-input:focus { border-color: rgba(37,99,235,0.45); box-shadow: 0 0 0 4px rgba(37,99,235,0.12); }
+  #ms-gate-actions { display: flex; gap: 10px; margin-top: 12px; }
+  #ms-gate-btn {
+    flex: 1; padding: 12px 14px; border-radius: 12px;
+    border: 1px solid rgba(37,99,235,0.35);
+    background: #2563eb; color: #fff; font-weight: 700;
+    cursor: pointer;
+  }
+  #ms-gate-btn:hover { opacity: 0.95; }
+  #ms-gate-hint { margin-top: 10px; font-size: 12px; color: #6b7280; }
+  #ms-gate-error { margin-top: 10px; font-size: 13px; color: #dc2626; display: none; }
+</style>
+
+</head>
+<body class="bg-slate-50 text-slate-800 overflow-x-hidden theme-light">
+<div id="ms-app-root">
+
+  <header class="bg-white border-b border-slate-200 sticky top-0 z-30">
+    <div class="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between gap-3">
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 rounded-xl bg-sky-100 flex items-center justify-center text-sky-700 font-extrabold">MS</div>
+        <div>
+          <div class="font-extrabold">Market Sentinel (AR)</div>
+          <div class="text-xs text-slate-500">فلترة مخاطر — بدون توصيات شراء/بيع</div>
+        </div>
+      </div>
+
+      <div class="flex items-center gap-2">
+        <button id="demoBtn" class="px-3 py-2 rounded-xl bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100 text-sm font-bold">وضع تجريبي</button>
+        <button id="refreshBtn" class="px-3 py-2 rounded-xl bg-sky-50 text-sky-700 border border-sky-200 hover:bg-sky-100 text-sm font-bold">تحديث</button>
+      </div>
+    </div>
+
+    <nav class="bg-white lg:hidden">
+      <div class="max-w-6xl mx-auto px-4 pb-3">
+        <div class="flex flex-wrap gap-2">
+          <a class="tab px-3 py-2 rounded-xl text-sm font-bold border" href="#/dashboard" data-route="dashboard">لوحة المتابعة</a>
+          <a class="tab px-3 py-2 rounded-xl text-sm font-bold border" href="#/add" data-route="add">إضافة سهم</a>
+          <a class="tab px-3 py-2 rounded-xl text-sm font-bold border" href="#/alerts" data-route="alerts">التنبيهات</a>
+          <a class="tab px-3 py-2 rounded-xl text-sm font-bold border" href="#/liquidity" data-route="liquidity">السيولة والتدفق</a>
+          <a class="tab px-3 py-2 rounded-xl text-sm font-bold border" href="#/news" data-route="news">تقصّي الخبر</a>
+          <a class="tab px-3 py-2 rounded-xl text-sm font-bold border" href="#/settings" data-route="settings">الإعدادات</a>
+          <a class="tab px-3 py-2 rounded-xl text-sm font-bold border" href="#/screener" data-route="screener">ماسح خارجي</a>
+          <a class="tab px-3 py-2 rounded-xl text-sm font-bold border" href="#/catalog" data-route="catalog">كتالوج النظام</a>
+        </div>
+      </div>
+    </nav>
+  </header>
+
+  <main class="max-w-6xl mx-auto px-4 py-6">
+    <div id="banner" class="hidden mb-4"></div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-[320px,1fr] gap-4 min-w-0">
+      <aside class="hidden lg:block">
+        <div class="bg-white border border-slate-200 rounded-2xl p-3 sticky top-24">
+          <div class="text-xs text-slate-500 font-bold mb-2">التنقل</div>
+          <div class="flex flex-col gap-2">
+            <a class="tab px-3 py-2 rounded-xl text-sm font-bold border" href="#/dashboard" data-route="dashboard">لوحة المتابعة</a>
+            <a class="tab px-3 py-2 rounded-xl text-sm font-bold border" href="#/add" data-route="add">إضافة سهم</a>
+            <a class="tab px-3 py-2 rounded-xl text-sm font-bold border" href="#/alerts" data-route="alerts">التنبيهات</a>
+            <a class="tab px-3 py-2 rounded-xl text-sm font-bold border" href="#/liquidity" data-route="liquidity">السيولة والتدفق</a>
+            <a class="tab px-3 py-2 rounded-xl text-sm font-bold border" href="#/news" data-route="news">تقصّي الخبر</a>
+            <a class="tab px-3 py-2 rounded-xl text-sm font-bold border" href="#/settings" data-route="settings">الإعدادات</a>
+            <a class="tab px-3 py-2 rounded-xl text-sm font-bold border" href="#/screener" data-route="screener">ماسح خارجي</a>
+            <a class="tab px-3 py-2 rounded-xl text-sm font-bold border" href="#/catalog" data-route="catalog">كتالوج النظام</a>
+          </div>
+          <div class="mt-3 text-[11px] text-slate-500 leading-5">
+            <div class="font-extrabold text-slate-700 mb-1">ملاحظة</div>
+            <div>التطبيق فلتر مخاطر وتحليل قابل للتفسير — ليس توصية شراء/بيع.</div>
+          </div>
+        </div>
+      </aside>
+
+      <div class="min-w-0">
+        <!-- Views -->
+    <section id="view-dashboard" class="view"></section>
+    <section id="view-add" class="view hidden"></section>
+    <section id="view-details" class="view hidden"></section>
+    <section id="view-liquidity" class="view hidden"></section>
+    <section id="view-news" class="view hidden"></section>
+    <section id="view-alerts" class="view hidden"></section>
+    <section id="view-settings" class="view hidden"></section>
+    <section id="view-screener" class="view hidden"></section>
+    <section id="view-catalog" class="view hidden"></section>
+      </div>
+    </div>
+  </main>
+
+  <footer class="max-w-6xl mx-auto px-4 pb-10 text-xs text-slate-500">
+    <div class="border-t border-slate-200 pt-4">
+      <div>© MARKET_SENTINEL_AR v3.12.4 — مشروع فلترة مخاطر (Explainable) — لا تنبؤ ولا توصيات.</div>
+      <div class="mt-2 flex items-center justify-between flex-wrap gap-2">
+        <div class="ms-chip blue">👥 مستخدمون نشطون (10 دقائق): <span id="activeUsers">—</span></div>
+        <div class="ms-chip green">🔒 Session Isolation: ON</div>
+      </div>
+    </div>
+  </footer>
+
+  <script type="module" src="/api.js"></script>
+  <script type="module" src="/ui.js"></script>
+  <script type="module" src="/app.js"></script>
+
+</div>
+<script id="ms-gate-script">
+(function(){
+  var PASS = "زهراء";
+  var KEY  = "ms_gate_ok_v1";
+  var body = document.body;
+
+  function unlock() {
+    try { localStorage.setItem(KEY, "1"); } catch(e) {}
+    var ov = document.getElementById("ms-gate-overlay");
+    if (ov) ov.remove();
+    body.classList.remove("ms-locked");
+  }
+
+  function lock() {
+    body.classList.add("ms-locked");
+  }
+
+  function alreadyOk() {
+    try { return localStorage.getItem(KEY) === "1"; } catch(e) { return false; }
+  }
+
+  function mount() {
+    if (document.getElementById("ms-gate-overlay")) return;
+    var tmp = document.createElement("div");
+    tmp.innerHTML = '<div id="ms-gate-overlay" dir="rtl" aria-label="بوابة الدخول">
+  <div id="ms-gate-card">
+    <div id="ms-gate-title">🔒 دخول Market Sentinel AR</div>
+    <div id="ms-gate-sub">هذه نسخة خاصة للعرض. أدخل كلمة المرور للمتابعة.</div>
+    <input id="ms-gate-input" type="password" inputmode="text" autocomplete="current-password" placeholder="كلمة المرور" />
+    <div id="ms-gate-actions">
+      <button id="ms-gate-btn" type="button">دخول</button>
+    </div>
+    <div id="ms-gate-error">كلمة المرور غير صحيحة.</div>
+    <div id="ms-gate-hint">ملاحظة: هذا قفل بسيط لنسخة عامة (ليس نظام حسابات).</div>
+  </div>
+</div>';
+    document.body.appendChild(tmp.firstElementChild);
+  }
+
+  function bind() {
+    var input = document.getElementById("ms-gate-input");
+    var btn   = document.getElementById("ms-gate-btn");
+    var err   = document.getElementById("ms-gate-error");
+
+    function attempt() {
+      var val = (input && input.value ? input.value.trim() : "");
+      if (val === PASS) {
+        unlock();
+      } else {
+        if (err) err.style.display = "block";
+        if (input) input.focus();
+      }
+    }
+
+    if (btn) btn.addEventListener("click", attempt);
+    if (input) input.addEventListener("keydown", function(e){ if (e.key === "Enter") attempt(); });
+    setTimeout(function(){ if (input) input.focus(); }, 50);
+  }
+
+  if (alreadyOk()) return;
+  lock();
+  mount();
+  bind();
+})();
+</script>
+</body>
+</html>

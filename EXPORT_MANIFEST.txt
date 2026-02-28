@@ -1,0 +1,39 @@
+EXPORT_MANIFEST.txt
+Project: MARKET_SENTINEL_AR
+Version: 3.12.4
+Generated: 2026-02-27T11:24:49Z
+
+Files:
+- .env.example | 1412 bytes | sha256:3abf4f1518df480c3f7ec927a2efa8b3ba6558deed3a5a8dc26529b5a794819b
+- .npmrc | 76 bytes | sha256:2eeb4ba20f89fa38a46345934d17c93747d66b6eb101a5979b01baa0c03b5afe
+- .nvmrc | 3 bytes | sha256:5378796307535df3ec8d8b15a2e2dc5641419c3d3060cfe32238c0fa973f7aa3
+- EXPORT_MANIFEST.txt | 2466 bytes | sha256:9b6d5b3ba068f4164705d5e9564565eff1fb07f91c64f4510027fdc04f0fb6b2
+- README.md | 11930 bytes | sha256:6904585933543978fac8907301c693313af3213a5d20771fd8912937a9b69a13
+- package-lock.json | 44395 bytes | sha256:ad84edd76ba953284f37bb6c90ca803fc253cbf420f813549030a0ed1983a34e
+- package.json | 502 bytes | sha256:f43dd6f910897b1cb023df47fa6827eba212c5c4cda5d799bfe22cf61b2d5904
+- package.json.bak | 450 bytes | sha256:fe7eeec63ca64fc6a6445aeb93ad380309413853980fa1f016d407505d259cba
+- public/api.js | 2294 bytes | sha256:23257a02e626431610654d74e20cd45b25d8421bb4b2a510fa599f1e4f1ce778
+- public/app.js | 43380 bytes | sha256:77f7acaedb6f1b626c7ab41bdd5119ec634d4c105e1685366751ed5499e35909
+- public/index.html | 11988 bytes | sha256:324824dbea61153fa7482197f6fa551bc0f2237ed58cfb262e2114fb4e00198d
+- public/light-theme.css | 5259 bytes | sha256:2307d6d345770cf01cb4b5a4e6bc00ef792e6ebc9baa6eacaa0883a09ff9fde3
+- public/ui.js | 129817 bytes | sha256:7a958b068589072865ba74fce0964b1dcb30530ebcfc481507f27054ad7df0a7
+- render.yaml | 1535 bytes | sha256:7efd244063f1063be5438dd548f559f460e0bfe93dfb68060c5483af14b91b21
+- server/analyze.js | 91579 bytes | sha256:642c22f7f6fd6d77d4f9f0566c4ed22e3e0a99003232cfe74dcb18bca5cacf06
+- server/context.js | 1817 bytes | sha256:96803c0617028d74702b7b6dc1d995e8d15a05dae745096e1ae0b99c57c2702a
+- server/crossMarketMap.js | 906 bytes | sha256:6dd28239c5e5306bf675c5d324f30927dcb705d1cc2a4dca29636bc0f24b003d
+- server/db.js | 505 bytes | sha256:61c53bb6e290d019a2ae6a85b6fd3810c47f8508dc3202b2e7cd3ee68dd74c12
+- server/housekeepingCron.js | 7314 bytes | sha256:7c98cf73ed968a978f4bb39612c9b1311ef19c229c67c1a0f79efc0984a25ac2
+- server/index.js | 4009 bytes | sha256:5906c14a04def16652fb944a345d0ef37ef06f28c4ccd88288858f992f35def0
+- server/indicators.js | 6313 bytes | sha256:54e1e6a7e1d5fd078e510e5ca5f8daa10911e13ac8abc4f0fc277fca6115fbdf
+- server/journalCron.js | 2489 bytes | sha256:94f8286dcd80331de7f7eaa6831ce5d3f00ffdbbceaa035a30475af2a4ff0182
+- server/liquidity.js | 4709 bytes | sha256:1f35b6687839969f4357122d7cb01d7fa3c55707ef45bd1d021a8ae89c9ee89e
+- server/marketData.js | 22478 bytes | sha256:970a5c2debdb904502fc4c2c6c0529f7c06c5597f5ce3ed6cbb3543cc1eebc7e
+- server/migrate.js | 798 bytes | sha256:928cee4ae0107db7d374c4c4f7aaf11de4fce222b975fc50dfbe43232c3a8fd8
+- server/routes.js | 60854 bytes | sha256:f35bd4b2dcdf3d4758a379c22da6aa785344c46bb0d8357a5a0208ff81881230
+- server/routes.js.bak | 66511 bytes | sha256:549ad1c304878663208d0dd62bdb6c4f27eb48f28e91fda59325ea9d085b9c0f
+- server/schema.sql | 9277 bytes | sha256:8908464c3611878f3abac646736495fce63200353aa435bc46a6b3dcd8796cb2
+- server/sectorConfig.js | 868 bytes | sha256:0610a8fca8e1b06949e48e07d75941f107eb903db6b277a5566ae7e65f34e4f8
+- server/sectorHeatmap.js | 1849 bytes | sha256:b385a4e8fd210e450816e1ed259527b84a29170cc59624ffce1a92a97f32acbe
+- server/seed.js | 1784 bytes | sha256:71c0be63c90f4a7a5bf7ed07eeb034af254ba65aa64ec9481f23f27c7ef48c6d
+- server/sentimentProviders.js | 3498 bytes | sha256:eeab5bbe244d35e022d5e6940b885a877b9b33e35270234b06d52ad539b4b355
+- server/smartMoney.js | 7210 bytes | sha256:f404ae36abba6be6af834e13caf65ee7d6bedb8fa6f9809d9f85e34a89ca694f
