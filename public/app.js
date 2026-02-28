@@ -243,7 +243,7 @@ function renderNewsView(container, analysis) {
   }[t] || 'أخرى');
 
   if (btnClear) {
-    btnClear.addEventListener('click', () => {
+    if (btnClear) btnClear.addEventListener(
       if (elUrl) elUrl.value = '';
       if (elSum) elSum.value = '';
       if (elVer) elVer.checked = false;
@@ -252,7 +252,7 @@ function renderNewsView(container, analysis) {
   }
 
   if (btnSave) {
-    btnSave.addEventListener('click', () => {
+    if (btnSave) btnSave.addEventListener(
       const s = String(elSym?.value || '').trim().toUpperCase();
       const m = String(elMkt?.value || 'SA').toUpperCase();
       const url = String(elUrl?.value || '').trim();
@@ -354,7 +354,7 @@ function bindSettingsUI(container) {
   const setStatus = (t) => { if (status) status.textContent = t || ''; };
 
   if (btnSave) {
-    btnSave.addEventListener('click', async () => {
+    if (btnSave) btnSave.addEventListener(
       try {
         setStatus('...جاري الحفظ');
         await API.saveSettings({
@@ -396,7 +396,7 @@ function bindSettingsUI(container) {
 const demoBtn = document.getElementById('demoBtn');
 const refreshBtn = document.getElementById('refreshBtn');
 
-demoBtn.addEventListener('click', async () => {
+if (demoBtn) demoBtn.addEventListener(
   try {
     setBanner('info', 'تشغيل الوضع التجريبي', 'جارٍ إنشاء بيانات Demo (AAPL, 2222.SR, DUMP) + Snapshots + Alerts...');
     await API.demoSeed();
@@ -407,11 +407,11 @@ demoBtn.addEventListener('click', async () => {
   }
 });
 
-refreshBtn.addEventListener('click', async () => {
+if (refreshBtn) refreshBtn.addEventListener(
   await navigateTo(location.hash || '#/dashboard', true);
 });
 
-window.addEventListener('hashchange', () => navigateTo(location.hash));
+if (window) window.addEventListener(
 
 
 function startActiveUsersPoll() {
@@ -815,11 +815,11 @@ function bindPositionToggle(symbol, market) {
     }
   };
 
-  yes.addEventListener('change', () => { if (yes.checked) apply(true); });
-  no.addEventListener('change', () => { if (no.checked) apply(false); });
+  if (yes) yes.addEventListener(
+  if (no) no.addEventListener(
 
   if (expSel) {
-    expSel.addEventListener('change', () => {
+    if (expSel) expSel.addEventListener(
       // exposure only meaningful when owned, but we persist it anyway
       const ownedNow = !!document.getElementById('ms_pos_owned')?.checked;
       apply(ownedNow);
@@ -833,7 +833,7 @@ async function bindCopyPlan() {
   const btn = document.getElementById('btnCopyPlan');
   if (!btn) return;
 
-  btn.addEventListener('click', async () => {
+  if (btn) btn.addEventListener(
     const data = (typeof window !== 'undefined') ? (window.__ms_lastDetailData || null) : null;
     if (!data) {
       setBanner('warn', 'لا توجد بيانات', 'قم بتحليل السهم أولاً.'); 
@@ -867,7 +867,7 @@ function bindScanControls() {
     location.hash = `#/details?symbol=${encodeURIComponent(symbol)}&market=${encodeURIComponent(market)}`;
   };
 
-  btn.addEventListener('click', () => {
+  if (btn) btn.addEventListener(
     const v = inp.value;
     if (!String(v || '').trim()) {
       setBanner('warn', 'أدخل رمز/رقم السهم', 'مثال: AAPL أو 2222 أو 2222.SR');
@@ -876,7 +876,7 @@ function bindScanControls() {
     goDetails(v);
   });
 
-  inp.addEventListener('keydown', (e) => {
+  if (inp) inp.addEventListener(
     if (e.key === 'Enter') {
       e.preventDefault();
       btn.click();
@@ -884,7 +884,7 @@ function bindScanControls() {
   });
 
   if (add) {
-    add.addEventListener('click', async () => {
+    if (add) add.addEventListener(
       const v = inp.value;
       const { symbol, market } = inferMarketAndNormalizeSymbol(v);
       if (!symbol || !market) {
@@ -960,8 +960,8 @@ function bindDashboardControls(rows) {
   const closeSheet = () => { if (sheet) sheet.classList.add('hidden'); };
 
   if (openBtn && sheet) {
-    openBtn.addEventListener('click', openSheet);
-    sheet.addEventListener('click', (e) => {
+    if (openBtn) openBtn.addEventListener(
+    if (sheet) sheet.addEventListener(
       const t = e.target;
       if (t && t.getAttribute && t.getAttribute('data-close') === '1') closeSheet();
     });
@@ -983,7 +983,7 @@ function bindDashboardControls(rows) {
   syncDesktopToMobile();
 
   if (applyBtn) {
-    applyBtn.addEventListener('click', () => {
+    if (applyBtn) applyBtn.addEventListener(
       syncMobileToDesktop();
       apply();
       closeSheet();
@@ -991,12 +991,12 @@ function bindDashboardControls(rows) {
   }
 
 
-  input.addEventListener('input', () => { apply(); syncDesktopToMobile(); });
-  selSort.addEventListener('change', () => { apply(); syncDesktopToMobile(); });
-  selTraffic.addEventListener('change', () => { apply(); syncDesktopToMobile(); });
+  if (input) input.addEventListener(
+  if (selSort) selSort.addEventListener(
+  if (selTraffic) selTraffic.addEventListener(
 
   for (const p of pills) {
-    p.addEventListener('click', () => {
+    if (p) p.addEventListener(
       mode = (p.getAttribute('data-mode') || 'ALL').toUpperCase();
       for (const x of pills) {
         const active = (x.getAttribute('data-mode') || 'ALL').toUpperCase() === mode;
@@ -1023,7 +1023,7 @@ function bindAddForm() {
   const btn = document.getElementById('addBtn');
   if (!btn) return;
 
-  btn.addEventListener('click', async () => {
+  if (btn) btn.addEventListener(
     const symbol = document.getElementById('addSymbol').value.trim();
     const market = document.getElementById('addMarket').value;
     if (!symbol) {
@@ -1046,7 +1046,7 @@ function bindAddForm() {
 function bindReanalyze(symbol, market) {
   const btn = document.getElementById('reanalyzeBtn');
   if (!btn) return;
-  btn.addEventListener('click', async () => {
+  if (btn) btn.addEventListener(
     const newsText = document.getElementById('newsText').value;
     const hype = document.getElementById('hype').checked;
     const noOfficial = document.getElementById('noOfficial').checked;
